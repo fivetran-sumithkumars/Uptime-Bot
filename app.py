@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime,timedelta
 import json
 import base64
-
+import requests
 from slack_bolt import App
 from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -72,7 +72,7 @@ def get_URL(connector_string):
     
     NR_ACCOUNT_FIVERAN_PRODUCTION = "2880887"
 
-    query = f"labels.app.kubernetes.io/name:'donkey' OR labels.app:donkey labels.connector-detail:'{connector_string}' level:'SEVERE'"
+    query = "labels.app.kubernetes.io/name:\"donkey\" OR labels.app:donkey labels.connector-detail:'%s' level:SEVERE" % (connector_string)
     attrs = ['timestamp', 'level', 'event_summary', 'message', 'exception', 'time']
 
     data = {
@@ -98,19 +98,49 @@ def getConnectorString(row):
     connector_string=f"{row['account_name']}/{row['group_name']}/{row['service']}/{row['schema']}"
     return connector_string
 
+def getErrorMessage(row):
+    print(f"Getting error from new relic started for {row['Connector String']}.......")
+    url = "https://api.newrelic.com/graphql"
+    query=f"SELECT `exception` FROM Log WHERE `labels.app.kubernetes.io/name` = 'donkey' OR `labels.app` = 'donkey' AND `annotations.connector-detail` = '{row['Connector String']}' AND `level` = 'SEVERE' SINCE 24 hours ago limit 1"
+    payload = "{\"query\":\"query {\\n  actor {\\n    account(id: 2880887) {\\n      name\\n      nrql(query: \\\"%s\\\") {\\n        results\\n      }\\n    }\\n  }\\n}\",\"variables\":{}}" %(query)
+    headers = {
+    'Content-Type': 'application/json',
+    'API-Key': os.getenv('NEW_RELIC_KEY_FIVETRAN')
+    }
+    try:
+        request = requests.post(url, headers=headers, data=payload)
+        response=request.json()
+        results=response['data']['actor']['account']['nrql']['results']
+        if results:
+            first_result = results[0]
+            exception = first_result.get("exception", None)
+
+        if exception:
+            # Log the exception for debugging
+            print(f"NRQL exception found: {exception}")
+            return exception
+
+        else:
+            return "Could not fetch error message, Please check using new relic log link"
+    
+    except Exception as e:
+        return "Could not fetch error message, Please check using new relic log link"
+    
 def processDataFrame(df):
+    print("Processing the data frame started.......")
     df['Connector String']=df.apply(getConnectorString, axis=1)
     df['New Relic Log Link'] = df.apply(getConnectorString, axis=1)
     df['New Relic Log Link'] = df['New Relic Log Link'].apply(lambda x: f'=HYPERLINK("{get_URL(x)}", "{x}")')
 
-
+    df['Error Message']=df.apply(getErrorMessage,axis=1)
     df=df.drop(['account_name'], axis=1)
     df=df.drop(['group_name'], axis=1)
     # df=df.drop(['service'], axis=1)
     df=df.drop(['schema'], axis=1)
 
     df['Create Exclusion Height Ticket'] = df.apply(getHeightTicketCreationLink, axis=1)
-    df = df.reindex(columns=['service','Connector String', 'percent_uptime', 'New Relic Log Link', 'Create Exclusion Height Ticket'])
+    df = df.reindex(columns=['service','Connector String', 'percent_uptime','Error Message','New Relic Log Link','Create Exclusion Height Ticket'])
+    print("Processing the data frame completed.......")
     return df
 
 def run_query_and_get_results(QUERY):
@@ -142,8 +172,8 @@ def schedule_message(channel_id,connector_ids):
 
 @app.error
 def custom_error_handler(error, body, logger):
-    print(f"Error: {error}")
-    print(f"Request body: {body}")
+    print(f"*************Error: {error}******************")
+
     
 @app.shortcut("uptime-bot")
 def open_modal(ack, shortcut, client):
@@ -216,7 +246,7 @@ def handle_view_submission_events(ack, body,client,view,logger):
 
     
     try:
-        client.chat_postMessage(channel=channel, text=msg)
+        # client.chat_postMessage(channel=channel, text=msg)
         execute(connector_ids_list.split(','))
         print(f"Uploading file to channel {channel}......")
         app.client.files_upload_v2(
@@ -230,7 +260,7 @@ def handle_view_submission_events(ack, body,client,view,logger):
         #     title = 'Connector Uptime',
         #     initial_comment = 'Here is the list of failing connectors data from BigQuery')
         print("Uploading file completed ......")
-    except e:
+    except Exception as e:
         logger.exception(f"Failed to post a message {e}")
 
 if __name__ == "__main__":
